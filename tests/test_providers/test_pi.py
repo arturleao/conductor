@@ -19,7 +19,7 @@ def test_pi_is_registered_without_starting_node() -> None:
     capabilities = get_capabilities("pi")
     assert capabilities.streaming_events is True
     assert capabilities.mcp_tools is False
-    assert capabilities.workflow_tools_passthrough is False
+    assert capabilities.workflow_tools_passthrough is True
     assert capabilities.max_session_seconds is True
     assert capabilities.checkpoint_resume is True
 
@@ -132,4 +132,47 @@ async def test_execute_refuses_unsupported_plugin_components(kwargs: dict) -> No
         pytest.raises(ProviderError, match="does not support Conductor plugin"),
     ):
         await provider.execute(AgentDef(name="test", prompt="hello"), {}, "hello", **kwargs)
+    spawn.assert_not_called()
+
+
+async def test_execute_forwards_tools_allowlist_to_bridge() -> None:
+    """A `tools:` allowlist reaches the bridge payload, unmodified."""
+    provider = PiProvider()
+    process = MagicMock()
+    process.stdin.drain = AsyncMock()
+    process.stdout = asyncio.StreamReader()
+    process.stdout.feed_data(
+        (json.dumps({"type": "result", "text": "hello", "model": "test/model"}) + "\n").encode()
+    )
+    process.stdout.feed_eof()
+    process.stderr.read = AsyncMock(return_value=b"")
+    process.wait = AsyncMock(return_value=0)
+    process.returncode = 0
+    with patch(
+        "conductor.providers.pi.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as spawn:
+        await provider.execute(
+            AgentDef(name="test", prompt="hello"),
+            {},
+            "hello",
+            tools=["read", "grep", "find", "ls"],
+        )
+    spawn.assert_awaited_once()
+    sent = json.loads(process.stdin.write.call_args[0][0].decode().strip())
+    assert sent["tools"] == ["read", "grep", "find", "ls"]
+
+
+async def test_execute_rejects_unknown_tool_names() -> None:
+    provider = PiProvider()
+    with (
+        patch("conductor.providers.pi.asyncio.create_subprocess_exec") as spawn,
+        pytest.raises(ProviderError, match="unknown tool name"),
+    ):
+        await provider.execute(
+            AgentDef(name="test", prompt="hello"),
+            {},
+            "hello",
+            tools=["read", "not_a_real_tool"],
+        )
     spawn.assert_not_called()

@@ -18,13 +18,18 @@ from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 
 
+_KNOWN_PI_TOOLS = frozenset(
+    {"read", "bash", "powershell", "edit", "write", "grep", "find", "ls"}
+)
+
+
 class PiProvider(AgentProvider):
     """Run Pi SDK sessions through a JSONL Node bridge."""
 
     CAPABILITIES = ProviderCapabilities(
         tier="experimental",
         mcp_tools=False,
-        workflow_tools_passthrough=False,
+        workflow_tools_passthrough=True,
         streaming_events=True,
         agent_reasoning_events=True,
         reasoning_effort=("low", "medium", "high", "xhigh", "max"),
@@ -116,12 +121,14 @@ class PiProvider(AgentProvider):
                 is_retryable=False,
             )
         if tools:
-            raise ProviderError(
-                "Pi provider cannot map Conductor `tools:` allowlists to Pi tools.",
-                suggestion="Omit `tools:`. Pi's tool policy comes from Pi settings and extensions.",
-                provider_name="pi",
-                is_retryable=False,
-            )
+            unknown = sorted(set(tools) - _KNOWN_PI_TOOLS)
+            if unknown:
+                raise ProviderError(
+                    f"Pi provider received unknown tool name(s): {', '.join(unknown)}.",
+                    suggestion=f"Known Pi tools: {', '.join(sorted(_KNOWN_PI_TOOLS))}.",
+                    provider_name="pi",
+                    is_retryable=False,
+                )
         if skill_directories:
             raise ProviderError(
                 "Pi provider received native skill directories unexpectedly.",
@@ -153,6 +160,7 @@ class PiProvider(AgentProvider):
             "max_agent_iterations": max_iterations,
             "session_path": self._resume_session_ids.get(agent.name)
             or self._session_ids.get(agent.name),
+            "tools": tools,
         }
         if event_callback is not None:
             event_callback("agent_turn_start", {"turn": "awaiting_model"})
