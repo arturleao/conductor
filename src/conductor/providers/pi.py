@@ -17,10 +17,7 @@ from conductor.providers._event_format import emit_parse_recovery_event
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 
-
-_KNOWN_PI_TOOLS = frozenset(
-    {"read", "bash", "powershell", "edit", "write", "grep", "find", "ls"}
-)
+_KNOWN_PI_TOOLS = frozenset({"read", "bash", "powershell", "edit", "write", "grep", "find", "ls"})
 
 
 class PiProvider(AgentProvider):

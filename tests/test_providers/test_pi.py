@@ -176,3 +176,76 @@ async def test_execute_rejects_unknown_tool_names() -> None:
             tools=["read", "not_a_real_tool"],
         )
     spawn.assert_not_called()
+
+
+def _bridge_process_returning(text: str) -> MagicMock:
+    process = MagicMock()
+    process.stdin.drain = AsyncMock()
+    process.stdout = asyncio.StreamReader()
+    process.stdout.feed_data(
+        (json.dumps({"type": "result", "text": text, "model": "test/model"}) + "\n").encode()
+    )
+    process.stdout.feed_eof()
+    process.stderr.read = AsyncMock(return_value=b"")
+    process.wait = AsyncMock(return_value=0)
+    process.returncode = 0
+    return process
+
+
+async def test_omitted_tools_everywhere_reaches_bridge_as_null() -> None:
+    """Regression: no workflow ``tools:`` + no agent ``tools:`` must not become ``[]``.
+
+    ``WorkflowConfig.tools`` used to default to ``[]``, so every agent that
+    omitted its own ``tools:`` resolved to an empty allowlist. Once the pi
+    provider started honouring the allowlist (``workflow_tools_passthrough``)
+    that empty list reached the bridge and the model had zero tools. The
+    executor must now forward ``None`` (``null`` on the wire, which the
+    bridge reads as ``undefined`` -> Pi's default toolset).
+    """
+    from conductor.config.schema import WorkflowConfig
+    from conductor.executor.agent import AgentExecutor
+
+    config = WorkflowConfig.model_validate(
+        {
+            "workflow": {"name": "t", "entry_point": "a"},
+            "agents": [{"name": "a", "prompt": "hello", "provider": "pi"}],
+        }
+    )
+    assert config.tools is None
+
+    provider = PiProvider()
+    executor = AgentExecutor(provider, workflow_tools=config.tools)
+    process = _bridge_process_returning("hello")
+    with patch(
+        "conductor.providers.pi.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        await executor.execute(config.agents[0], {})
+    sent = json.loads(process.stdin.write.call_args[0][0].decode().strip())
+    assert "tools" in sent
+    assert sent["tools"] is None
+
+
+async def test_explicit_empty_workflow_tools_still_reaches_bridge_as_empty_list() -> None:
+    """An author who writes ``tools: []`` at workflow level still gets no tools."""
+    from conductor.config.schema import WorkflowConfig
+    from conductor.executor.agent import AgentExecutor
+
+    config = WorkflowConfig.model_validate(
+        {
+            "workflow": {"name": "t", "entry_point": "a"},
+            "tools": [],
+            "agents": [{"name": "a", "prompt": "hello", "provider": "pi"}],
+        }
+    )
+    assert config.tools == []
+
+    executor = AgentExecutor(PiProvider(), workflow_tools=config.tools)
+    process = _bridge_process_returning("hello")
+    with patch(
+        "conductor.providers.pi.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        await executor.execute(config.agents[0], {})
+    sent = json.loads(process.stdin.write.call_args[0][0].decode().strip())
+    assert sent["tools"] == []
