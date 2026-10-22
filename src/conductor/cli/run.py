@@ -28,12 +28,14 @@ from conductor.config.loader import load_config
 from conductor.console import MarkupFreeConsole, join, make_console, styled
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
+from conductor.executor.once import SessionMemory
 from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
     from conductor.config.instructions import DiscoveredInstruction
     from conductor.config.schema import ProviderSettings, WorkflowConfig
+    from conductor.engine.workflow import WorkflowEngine
     from conductor.events import WorkflowEvent
     from conductor.fleet.records import RunMode
 
@@ -2165,6 +2167,42 @@ def _write_terminal_record_for_current_process(
         logger.warning("Failed to write terminal run record", exc_info=True)
 
 
+def seed_sessions(registry: ProviderRegistry, path: Path) -> SessionMemory:
+    """Resume the sessions recorded in ``path`` (a missing file starts fresh).
+
+    Returns what those sessions have already seen, for the engine's ``once``.
+    """
+    if not path.exists():
+        return SessionMemory()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("ids"):
+        registry.set_resume_session_ids(data["ids"])
+    if data.get("cwds"):
+        registry.set_resume_session_cwds(data["cwds"])
+    return SessionMemory(data.get("seen"))
+
+
+def save_sessions(engine: WorkflowEngine, path: Path) -> None:
+    """Write the run's final provider session map to ``path`` atomically.
+
+    The file's existing entries are kept and the run's own laid over them: a
+    run whose providers never started (only script steps, or a provider not
+    used this time) must not erase sessions later runs will resume.
+    """
+    previous = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    ids, cwds = engine.collect_session_ids()
+    data = {
+        "version": 1,
+        "ids": {**previous.get("ids", {}), **(ids or {})},
+        "cwds": {**previous.get("cwds", {}), **(cwds or {})},
+        # The engine's memory started from the file's, so it already includes it.
+        "seen": engine.session_memory.to_json(),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 async def run_workflow_async(
     workflow_path: Path,
     inputs: dict[str, Any],
@@ -2180,6 +2218,7 @@ async def run_workflow_async(
     workspace_instructions: bool = False,
     cli_instructions: list[str] | None = None,
     print_loaded_instructions: bool = False,
+    sessions_file: Path | None = None,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -2199,6 +2238,10 @@ async def run_workflow_async(
         print_loaded_instructions: If True, print the resolved instruction file
             list (with scope and inclusion reason) to stderr before running.
             No-op unless ``workspace_instructions`` is also True.
+        sessions_file: Optional JSON file holding a provider session map. Its
+            sessions are resumed by agents with a matching ``session_key``, and
+            the run's final map is written back to it, also when the run fails,
+            so an orchestrator can chain runs that continue one session.
 
     Returns:
         The workflow output as a dictionary.
@@ -2420,6 +2463,8 @@ async def run_workflow_async(
 
         # Use ProviderRegistry for multi-provider support
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
+            session_memory = seed_sessions(registry, sessions_file) if sessions_file else None
+
             # Create and run workflow engine
             verbose_log("Starting workflow execution...")
 
@@ -2450,6 +2495,7 @@ async def run_workflow_async(
                 web_dashboard=dashboard,
                 instructions_preamble=instructions_preamble,
                 plugin_marketplaces=plugin_marketplaces,
+                session_memory=session_memory,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -2477,7 +2523,11 @@ async def run_workflow_async(
                         Text.from_markup("[dim]Press Esc to interrupt and provide guidance[/dim]")
                     )
 
-                result = await _run_with_stop_signal(engine, inputs, dashboard)
+                try:
+                    result = await _run_with_stop_signal(engine, inputs, dashboard)
+                finally:
+                    if sessions_file is not None:
+                        save_sessions(engine, sessions_file)
             except WorkflowTerminated as exc:
                 # Explicit `type: terminate status: failed` is an intentional
                 # outcome, not a crash — defer the raise so the dashboard

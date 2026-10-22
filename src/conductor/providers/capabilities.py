@@ -239,6 +239,13 @@ class ProviderCapabilities(BaseModel):
     session_continuity: bool = False
     """``True`` when the provider supports per-agent ``session_key``."""
 
+    tool_allowlist_covers_mcp: bool = True
+    """``False`` when an agent's ``tools:`` allowlist restricts only the
+    provider's built-in tools while every configured MCP server stays
+    attached (``claude-agent-sdk``). The validator then refuses any explicit
+    ``tools:`` on such a provider in a workflow that declares
+    ``mcp_servers``, since the allowlist would not mean what it says."""
+
     idle_recovery: bool = False
     """``True`` when the provider honors ``runtime.idle_timeout_seconds`` /
     ``runtime.max_idle_recovery_attempts`` (#488). These are Copilot-only
@@ -370,6 +377,7 @@ _PROVIDER_CLASS_PATHS: Final[dict[str, str]] = {
     "hermes": "conductor.providers.hermes:HermesProvider",
     "aca": "conductor.providers.aca:AcaRuntimeProvider",
     "pi": "conductor.providers.pi:PiProvider",
+    "host": "conductor.providers.host:HostProvider",
 }
 
 # Provider names that appear in the schema / factory but are not yet

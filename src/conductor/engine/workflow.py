@@ -53,6 +53,7 @@ from conductor.executor.mcp_step import (
     mcp_result_bytes,
     mcp_truncation_metadata,
 )
+from conductor.executor.once import SessionMemory
 from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.set_step import (
@@ -493,6 +494,7 @@ class WorkflowEngine:
         plugin_marketplaces: Mapping[str, Marketplace] | None = None,
         _guidance_channel: GuidanceChannel | None = None,
         _inherited_bg_mode: bool = False,
+        session_memory: SessionMemory | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -659,6 +661,9 @@ class WorkflowEngine:
         # them — a programmatic embedder can supply them via
         # ``set_plugin_marketplaces``.
         self._plugin_marketplaces: dict[str, Marketplace] = dict(plugin_marketplaces or {})
+        # What each session (`session_key`) has been sent or produced, for `| once`;
+        # seeded from and saved to `conductor run --sessions`.
+        self.session_memory = session_memory or SessionMemory()
         self._declared_plugin_sources = frozenset(config.workflow.runtime.plugin_sources)
 
         # For backward compatibility, create a default executor with single provider
@@ -675,6 +680,7 @@ class WorkflowEngine:
                 workflow_plugins=self._workflow_plugins,
                 plugin_marketplaces=self._plugin_marketplaces,
                 declared_plugin_sources=self._declared_plugin_sources,
+                session_memory=self.session_memory,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -1710,6 +1716,7 @@ class WorkflowEngine:
                 workflow_plugins=self._workflow_plugins,
                 plugin_marketplaces=self._plugin_marketplaces,
                 declared_plugin_sources=self._declared_plugin_sources,
+                session_memory=self.session_memory,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)
@@ -3378,33 +3385,12 @@ class WorkflowEngine:
         """
         self.limits = limits
 
-    def _write_checkpoint(
-        self, error: BaseException | None, trigger: CheckpointTrigger
-    ) -> Path | None:
-        """Serialize the current workflow state to a checkpoint file.
+    def collect_session_ids(self) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+        """Merged provider session map and session cwds, for checkpoints and ``--sessions``.
 
-        Shared by the on-failure and periodic checkpoint paths. Collects
-        session IDs from every provider that records them — Copilot per agent
-        name, ``claude-agent-sdk`` per namespaced ``session_key`` — and
-        delegates to :meth:`CheckpointManager.save_checkpoint`, which never
-        raises.
-
-        Args:
-            error: The exception that triggered the save, or ``None`` for a
-                periodic checkpoint.
-            trigger: ``"failure"`` or ``"periodic"``.
-
-        Returns:
-            Path to the saved checkpoint, or ``None`` when no ``workflow_path``
-            is set or saving failed.
+        Never raises: a provider that fails costs only its own sessions, and
+        an unexpected failure returns ``(None, None)``.
         """
-        if self.workflow_path is None:
-            logger.debug("No workflow_path set; skipping checkpoint save")
-            return None
-
-        # Collect session IDs from provider if available. Best-effort: a
-        # provider raising here must not break the (failure or periodic)
-        # checkpoint save, so the "never raises" contract holds for both paths.
         copilot_session_ids: dict[str, str] | None = None
         copilot_session_cwds: dict[str, str] | None = None
         try:
@@ -3454,6 +3440,36 @@ class WorkflowEngine:
             logger.debug("Session ID collection traceback", exc_info=True)
             copilot_session_ids = None
             copilot_session_cwds = None
+
+        return copilot_session_ids, copilot_session_cwds
+
+    def _write_checkpoint(
+        self, error: BaseException | None, trigger: CheckpointTrigger
+    ) -> Path | None:
+        """Serialize the current workflow state to a checkpoint file.
+
+        Shared by the on-failure and periodic checkpoint paths. Collects
+        session IDs from every provider that records them — Copilot per agent
+        name, ``claude-agent-sdk`` per namespaced ``session_key`` — and
+        delegates to :meth:`CheckpointManager.save_checkpoint`, which never
+        raises.
+
+        Args:
+            error: The exception that triggered the save, or ``None`` for a
+                periodic checkpoint.
+            trigger: ``"failure"`` or ``"periodic"``.
+
+        Returns:
+            Path to the saved checkpoint, or ``None`` when no ``workflow_path``
+            is set or saving failed.
+        """
+        if self.workflow_path is None:
+            logger.debug("No workflow_path set; skipping checkpoint save")
+            return None
+
+        # Best-effort: a provider raising here must not break the (failure or
+        # periodic) checkpoint save, so the "never raises" contract holds.
+        copilot_session_ids, copilot_session_cwds = self.collect_session_ids()
 
         return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
